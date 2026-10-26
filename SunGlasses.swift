@@ -1,5 +1,6 @@
 import AppKit
 import os
+import Security
 import ServiceManagement
 
 let log = Logger(subsystem: "com.josearci.SunGlasses", category: "fold")
@@ -17,6 +18,7 @@ final class SunGlasses: NSObject, NSApplicationDelegate {
     var down: (at: CGPoint, glasses: ClosedRange<CGFloat>)?  // where a ⌘-drag started
     var grabbed: String?  // bundle id of the icon being ⌘-dragged
     var synthesizing = false  // our own ⌘-drags, not the user's
+    let updater = Updater()
     let axQueue = DispatchQueue(label: "SunGlasses.ax")
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -33,6 +35,7 @@ final class SunGlasses: NSObject, NSApplicationDelegate {
             do { try SMAppService.mainApp.register() } catch { log.error("login item: \(error, privacy: .public)") }
         }
         log.notice("login item status: \(SMAppService.mainApp.status.rawValue)")
+        updater.start()
         let ws = NSWorkspace.shared.notificationCenter
         // apps launched while folded aren't on the allow-list yet, so refold to let them show
         ws.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [unowned self] _ in
@@ -56,6 +59,13 @@ final class SunGlasses: NSObject, NSApplicationDelegate {
             login.target = self
             login.state = SMAppService.mainApp.status == .enabled ? .on : .off
             menu.addItem(.separator())
+            menu.addItem(withTitle: "SunGlasses \(Updater.version)", action: nil, keyEquivalent: "")
+            if let ready = updater.ready {
+                menu.addItem(withTitle: "Restart to Update to \(ready.version)", action: #selector(installUpdate), keyEquivalent: "").target = self
+            } else if updater.canUpdate {
+                menu.addItem(withTitle: "Check for Updates", action: #selector(checkForUpdates), keyEquivalent: "").target = self
+            }
+            menu.addItem(.separator())
             menu.addItem(withTitle: "Quit SunGlasses", action: #selector(NSApp.terminate), keyEquivalent: "q")
             glasses.menu = menu
             glasses.button?.performClick(nil)
@@ -65,6 +75,13 @@ final class SunGlasses: NSObject, NSApplicationDelegate {
         } else {
             unfold()
         }
+    }
+
+    @objc func checkForUpdates() { updater.check() }
+
+    @objc func installUpdate() {
+        unfold()  // the restriction dies with this process anyway; drop it cleanly before relaunching
+        updater.installAndRelaunch()
     }
 
     @objc func toggleLogin() {
@@ -288,6 +305,102 @@ final class SunGlasses: NSObject, NSApplicationDelegate {
         }
         img.isTemplate = true
         return img
+    }
+}
+
+// Keeps SunGlasses current: checks the GitHub repo's latest release (at launch and every 6 hours), downloads
+// a newer one in the background, and installs it when the user picks Restart to Update. The only thing sent
+// anywhere is a plain GET of the public release info.
+final class Updater {
+    static let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+    static let build = Int(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "") ?? 0
+    static let repo = Bundle.main.object(forInfoDictionaryKey: "SunGlassesUpdateRepo") as? String
+    var canUpdate: Bool { Self.repo != nil }
+    private(set) var ready: (version: String, app: URL)?
+    private var checking = false
+
+    func start() {
+        guard canUpdate else { return }
+        check()
+        Timer.scheduledTimer(withTimeInterval: 6 * 3600, repeats: true) { [weak self] _ in self?.check() }
+    }
+
+    func check() {
+        guard let repo = Self.repo, ready == nil, !checking,
+              let api = URL(string: "https://api.github.com/repos/\(repo)/releases/latest") else { return }
+        checking = true
+        Task { @MainActor in
+            defer { checking = false }
+            do {
+                ready = try await fetchNewer(from: api)
+                if let ready { log.notice("update \(ready.version, privacy: .public) is ready to install") }
+            } catch {
+                log.notice("update check: \(error, privacy: .public)")  // offline or rate-limited: try again later, quietly
+            }
+        }
+    }
+
+    // Releases are tagged v1.0.<build> by the release workflow and carry a SunGlasses.zip asset.
+    private func fetchNewer(from api: URL) async throws -> (version: String, app: URL)? {
+        struct Release: Decodable {
+            struct Asset: Decodable { let name: String; let browser_download_url: URL }
+            let tag_name: String
+            let draft: Bool?
+            let prerelease: Bool?
+            let assets: [Asset]
+        }
+        var request = URLRequest(url: api)
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        let (data, _) = try await URLSession.shared.data(for: request)
+        let release = try JSONDecoder().decode(Release.self, from: data)
+        let version = String(release.tag_name.drop(while: { $0 == "v" }))
+        guard release.draft != true, release.prerelease != true,
+              let build = version.split(separator: ".").last.flatMap({ Int($0) }), build > Self.build,
+              let asset = release.assets.first(where: { $0.name == "SunGlasses.zip" }),
+              asset.browser_download_url.scheme == "https", asset.browser_download_url.host == "github.com"
+        else { return nil }
+        let (zip, _) = try await URLSession.shared.download(from: asset.browser_download_url)
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("SunGlasses-update-\(build)")
+        try? FileManager.default.removeItem(at: folder)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let unzip = Process()
+        unzip.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        unzip.arguments = ["-x", "-k", zip.path, folder.path]
+        try unzip.run()
+        unzip.waitUntilExit()
+        let app = folder.appendingPathComponent("SunGlasses.app")
+        guard unzip.terminationStatus == 0, Bundle(url: app)?.bundleIdentifier == Bundle.main.bundleIdentifier,
+              Self.carriesOurSignature(app)
+        else { throw CocoaError(.fileReadCorruptFile) }
+        return (version, app)
+    }
+
+    // The downloaded app must satisfy this app's designated requirement, i.e. be signed with the same
+    // certificate: a different one would break the Accessibility grant, and it's not our build.
+    static func carriesOurSignature(_ app: URL) -> Bool {
+        var me: SecCode?, mine: SecStaticCode?, requirement: SecRequirement?, theirs: SecStaticCode?
+        guard SecCodeCopySelf([], &me) == errSecSuccess, let me,
+              SecCodeCopyStaticCode(me, [], &mine) == errSecSuccess, let mine,
+              SecCodeCopyDesignatedRequirement(mine, [], &requirement) == errSecSuccess, let requirement,
+              SecStaticCodeCreateWithPath(app as CFURL, [], &theirs) == errSecSuccess, let theirs
+        else { return false }
+        return SecStaticCodeCheckValidity(theirs, [], requirement) == errSecSuccess
+    }
+
+    // Swaps the installed app for the downloaded one and relaunches.
+    func installAndRelaunch() {
+        guard let ready else { return }
+        let installed = Bundle.main.bundleURL
+        do {
+            _ = try FileManager.default.replaceItemAt(installed, withItemAt: ready.app)
+        } catch {
+            return log.error("couldn't replace \(installed.path, privacy: .public): \(error, privacy: .public)")
+        }
+        let relaunch = Process()
+        relaunch.executableURL = URL(fileURLWithPath: "/bin/sh")
+        relaunch.arguments = ["-c", "sleep 1; /usr/bin/open \"$0\"", installed.path]
+        try? relaunch.run()
+        NSApp.terminate(nil)
     }
 }
 

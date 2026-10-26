@@ -1,0 +1,68 @@
+# Every push to main: build SunGlasses.app and publish it as a GitHub Release.
+# Installed copies of SunGlasses check the latest release and update themselves.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history: the version number is the commit count
+
+      # The one certificate every build is signed with (scripts/make-signing-cert.sh): macOS ties the
+      # Accessibility grant to it, so an ad-hoc release would make every user re-grant after each update.
+      - name: Import signing certificate
+        env:
+          SIGNING_P12: ${{ secrets.SIGNING_P12 }}
+          SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+        run: |
+          if [ -z "$SIGNING_P12" ]; then echo "::warning::No SIGNING_P12 secret; this release will be ad-hoc signed"; exit 0; fi
+          echo "$SIGNING_P12" | base64 -d > cert.p12
+          security create-keychain -p ci build.keychain-db
+          security default-keychain -s build.keychain-db
+          security unlock-keychain -p ci build.keychain-db
+          security import cert.p12 -k build.keychain-db -P "$SIGNING_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci build.keychain-db >/dev/null
+          rm cert.p12
+
+      - name: Build
+        run: ./scripts/build-app.sh
+        env:
+          SUNGLASSES_UPDATE_REPO: ${{ github.repository }}
+
+      - name: Check the signature
+        run: |
+          codesign --verify --verbose=2 .build/SunGlasses.app
+          codesign -dr - .build/SunGlasses.app 2>&1 | grep designated
+
+      - name: Package
+        run: ditto -c -k --keepParent .build/SunGlasses.app SunGlasses.zip
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BUILD=$(git rev-list --count HEAD)
+          TAG="v1.0.$BUILD"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "$TAG already released"; exit 0
+          fi
+          PREVIOUS=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          NOTES=$(git log --no-merges --pretty='- %s' ${PREVIOUS:+$PREVIOUS..}HEAD | head -40)
+          gh release create "$TAG" SunGlasses.zip \
+            --title "SunGlasses 1.0.$BUILD" \
+            --notes "${NOTES:-Latest build of main.}" \
+            --target "$GITHUB_SHA"
