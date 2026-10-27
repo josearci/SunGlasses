@@ -30,6 +30,8 @@ That brings a few limits:
 
 - Hiding is per app: an app with several icons hides them all together.
 - Apple's own items (clock, Wi-Fi, Sound, Control Center) can't be hidden.
+- Assessment mode also locks Notification Center while folded. Clicking the clock still opens it: SunGlasses lifts the restriction while it's open (hidden icons show meanwhile) and folds again when it closes.
+- Apps outside `/Applications` (even `~/Applications`) are hidden while folded, whether or not they're behind the sunglasses.
 - macOS keeps an app's own icon visible only for the copy in `/Applications`; a copy anywhere else hides its own sunglasses.
 - Being a private framework, a macOS update could break it. If the framework is missing, SunGlasses leaves everything visible rather than hiding the wrong things.
 

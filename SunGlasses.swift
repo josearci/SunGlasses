@@ -18,6 +18,7 @@ final class SunGlasses: NSObject, NSApplicationDelegate {
     var down: (at: CGPoint, glasses: ClosedRange<CGFloat>)?  // where a ⌘-drag started
     var grabbed: String?  // bundle id of the icon being ⌘-dragged
     var synthesizing = false  // our own ⌘-drags, not the user's
+    var peeking = false  // folded, but lifted while Notification Center is open
     let updater = Updater()
     let axQueue = DispatchQueue(label: "SunGlasses.ax")
 
@@ -70,7 +71,10 @@ final class SunGlasses: NSObject, NSApplicationDelegate {
             glasses.menu = menu
             glasses.button?.performClick(nil)
             glasses.menu = nil
-        } else if assertion == nil {
+            return
+        }
+        peeking = false
+        if assertion == nil {
             fold()
         } else {
             unfold()
@@ -138,8 +142,51 @@ final class SunGlasses: NSObject, NSApplicationDelegate {
                 let g = glassesSpan()
                 // queued behind the lookup started on mouse-down, so `grabbed` is set by then
                 axQueue.async { DispatchQueue.main.async { self.dropped(at: m, from: d, glassesNow: g) } }
+            } else if assertion != nil, let p = e.cgEvent?.location {
+                axQueue.async {
+                    guard Self.isClock(at: p) else { return }
+                    DispatchQueue.main.async { self.peek(clickingAt: p) }
+                }
             }
         }
+    }
+
+    // Exam lockdown also locks Notification Center, so clicking the clock does nothing while folded.
+    // Lift the restriction, pass the click on, and fold again once Notification Center closes.
+    func peek(clickingAt p: CGPoint) {
+        guard assertion != nil else { return }
+        assertion?.perform(NSSelectorFromString("invalidate"))
+        assertion = nil
+        peeking = true
+        updateIcon()
+        for type in [CGEventType.leftMouseDown, .leftMouseUp] {
+            CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: p, mouseButton: .left)?.post(tap: .cghidEventTap)
+        }
+        refoldWhenNotificationCenterCloses()
+    }
+
+    func refoldWhenNotificationCenterCloses() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [self] in
+            guard peeking else { return }
+            if Self.notificationCenterOpen() { return refoldWhenNotificationCenterCloses() }
+            peeking = false
+            fold()
+        }
+    }
+
+    static func isClock(at p: CGPoint) -> Bool {
+        var hit: AXUIElement?, id: CFTypeRef?
+        guard AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(p.x), Float(p.y), &hit) == .success, let hit,
+              AXUIElementCopyAttributeValue(hit, kAXIdentifierAttribute as CFString, &id) == .success
+        else { return false }
+        return id as? String == "com.apple.menuextra.clock"
+    }
+
+    // The open panel sits above normal windows; notification banners use a negative layer.
+    static func notificationCenterOpen() -> Bool {
+        let nc = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.notificationcenterui").map(\.processIdentifier)
+        let windows = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] ?? []
+        return windows.contains { nc.contains($0[kCGWindowOwnerPID as String] as? pid_t ?? 0) && ($0[kCGWindowLayer as String] as? Int ?? 0) > 0 }
     }
 
     func dropped(at m: CGPoint?, from d: (at: CGPoint, glasses: ClosedRange<CGFloat>), glassesNow: ClosedRange<CGFloat>?) {
