@@ -18,7 +18,7 @@ final class SunGlasses: NSObject, NSApplicationDelegate {
     var down: (at: CGPoint, glasses: ClosedRange<CGFloat>)?  // where a ⌘-drag started
     var grabbed: String?  // bundle id of the icon being ⌘-dragged
     var synthesizing = false  // our own ⌘-drags, not the user's
-    var peeking = false  // folded, but lifted while Notification Center is open
+    var peeking = false  // folded, but lifted for a moment so Notification Center can open
     let updater = Updater()
     let axQueue = DispatchQueue(label: "SunGlasses.ax")
 
@@ -152,23 +152,19 @@ final class SunGlasses: NSObject, NSApplicationDelegate {
     }
 
     // Exam lockdown also locks Notification Center, so clicking the clock does nothing while folded.
-    // Lift the restriction, pass the click on, and fold again once Notification Center closes.
+    // It only stops it opening, though: lift the restriction, pass the click on, and fold again straight after.
     func peek(clickingAt p: CGPoint) {
         guard assertion != nil else { return }
         assertion?.perform(NSSelectorFromString("invalidate"))
         assertion = nil
         peeking = true
-        updateIcon()
         for type in [CGEventType.leftMouseDown, .leftMouseUp] {
             CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: p, mouseButton: .left)?.post(tap: .cghidEventTap)
         }
-        refoldWhenNotificationCenterCloses()
-    }
-
-    func refoldWhenNotificationCenterCloses() {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [self] in
-            guard peeking else { return }
-            if Self.notificationCenterOpen() { return refoldWhenNotificationCenterCloses() }
+        // ponytail: fixed delay, measured on macOS 27 (50 ms sometimes too short, 150 ms always enough);
+        // wait for Notification Center's window instead if a slower Mac needs it
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [self] in
+            guard peeking else { return }  // the glasses were clicked meanwhile
             peeking = false
             fold()
         }
@@ -180,13 +176,6 @@ final class SunGlasses: NSObject, NSApplicationDelegate {
               AXUIElementCopyAttributeValue(hit, kAXIdentifierAttribute as CFString, &id) == .success
         else { return false }
         return id as? String == "com.apple.menuextra.clock"
-    }
-
-    // The open panel sits above normal windows; notification banners use a negative layer.
-    static func notificationCenterOpen() -> Bool {
-        let nc = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.notificationcenterui").map(\.processIdentifier)
-        let windows = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] ?? []
-        return windows.contains { nc.contains($0[kCGWindowOwnerPID as String] as? pid_t ?? 0) && ($0[kCGWindowLayer as String] as? Int ?? 0) > 0 }
     }
 
     func dropped(at m: CGPoint?, from d: (at: CGPoint, glasses: ClosedRange<CGFloat>), glassesNow: ClosedRange<CGFloat>?) {
