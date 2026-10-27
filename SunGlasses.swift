@@ -18,6 +18,7 @@ final class SunGlasses: NSObject, NSApplicationDelegate {
     var down: (at: CGPoint, glasses: ClosedRange<CGFloat>)?  // where a ⌘-drag started
     var grabbed: String?  // bundle id of the icon being ⌘-dragged
     var synthesizing = false  // our own ⌘-drags, not the user's
+    var peeking = false  // folded, but lifted for a moment so Notification Center can open
     let updater = Updater()
     let axQueue = DispatchQueue(label: "SunGlasses.ax")
 
@@ -70,7 +71,10 @@ final class SunGlasses: NSObject, NSApplicationDelegate {
             glasses.menu = menu
             glasses.button?.performClick(nil)
             glasses.menu = nil
-        } else if assertion == nil {
+            return
+        }
+        peeking = false
+        if assertion == nil {
             fold()
         } else {
             unfold()
@@ -109,8 +113,7 @@ final class SunGlasses: NSObject, NSApplicationDelegate {
         assertion?.perform(NSSelectorFromString("invalidate"))
         assertion = nil
         updateIcon()
-        // once the icons are back, line up any that sit on the wrong side of the glasses
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.tuck(Array(self.inside)) {} }
+        // no tucking here: it would grab the mouse just as the user goes to ⌘-drag an icon out
     }
 
     func fold() {
@@ -129,8 +132,9 @@ final class SunGlasses: NSObject, NSApplicationDelegate {
                 down = (m, g)
                 grabbed = nil
                 let screens = NSScreen.screens.map(\.frame)
+                let hidden = assertion != nil ? inside : []
                 axQueue.async {
-                    let id = Self.app(atBarX: m.x, screens: screens)?.bundleIdentifier
+                    let id = Self.app(atBarX: m.x, screens: screens, skipping: hidden)?.bundleIdentifier
                     DispatchQueue.main.async { self.grabbed = id }
                 }
             } else if let d = down {
@@ -138,12 +142,44 @@ final class SunGlasses: NSObject, NSApplicationDelegate {
                 let g = glassesSpan()
                 // queued behind the lookup started on mouse-down, so `grabbed` is set by then
                 axQueue.async { DispatchQueue.main.async { self.dropped(at: m, from: d, glassesNow: g) } }
+            } else if assertion != nil, let p = e.cgEvent?.location {
+                axQueue.async {
+                    guard Self.isClock(at: p) else { return }
+                    DispatchQueue.main.async { self.peek(clickingAt: p) }
+                }
             }
         }
     }
 
+    // Exam lockdown also locks Notification Center, so clicking the clock does nothing while folded.
+    // It only stops it opening, though: lift the restriction, pass the click on, and fold again straight after.
+    func peek(clickingAt p: CGPoint) {
+        guard assertion != nil else { return }
+        assertion?.perform(NSSelectorFromString("invalidate"))
+        assertion = nil
+        peeking = true
+        for type in [CGEventType.leftMouseDown, .leftMouseUp] {
+            CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: p, mouseButton: .left)?.post(tap: .cghidEventTap)
+        }
+        // ponytail: fixed delay, measured on macOS 27 (50 ms sometimes too short, 150 ms always enough);
+        // wait for Notification Center's window instead if a slower Mac needs it
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [self] in
+            guard peeking else { return }  // the glasses were clicked meanwhile
+            peeking = false
+            fold()
+        }
+    }
+
+    static func isClock(at p: CGPoint) -> Bool {
+        var hit: AXUIElement?, id: CFTypeRef?
+        guard AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(p.x), Float(p.y), &hit) == .success, let hit,
+              AXUIElementCopyAttributeValue(hit, kAXIdentifierAttribute as CFString, &id) == .success
+        else { return false }
+        return id as? String == "com.apple.menuextra.clock"
+    }
+
     func dropped(at m: CGPoint?, from d: (at: CGPoint, glasses: ClosedRange<CGFloat>), glassesNow: ClosedRange<CGFloat>?) {
-        guard let id = grabbed else { return }
+        guard let id = grabbed else { return log.notice("⌘-drag: no app icon under the pointer") }
         grabbed = nil
         // macOS slides icons aside while you drag, so where the glasses were before or after both count
         let onGlasses = m.map { m in m.y < 40 && [d.glasses, glassesNow].contains { $0.map { $0.lowerBound - 4 ... $0.upperBound + 4 ~= m.x } ?? false } } ?? false
@@ -172,9 +208,10 @@ final class SunGlasses: NSObject, NSApplicationDelegate {
     }
 
     // The app owning the menu bar icon at this distance from the right edge.
-    static func app(atBarX x: CGFloat, screens: [CGRect]) -> NSRunningApplication? {
+    // Hidden apps keep reporting where their icons last were, on top of the visible ones there now, so skip them.
+    static func app(atBarX x: CGFloat, screens: [CGRect], skipping hidden: Set<String>) -> NSRunningApplication? {
         NSWorkspace.shared.runningApplications.first { app in
-            guard app.activationPolicy != .prohibited, app.bundleIdentifier != nil, app.processIdentifier != getpid(),
+            guard app.activationPolicy != .prohibited, let id = app.bundleIdentifier, !hidden.contains(id), app.processIdentifier != getpid(),
                   app.bundleURL?.path.hasPrefix("/System/") == false  // clock, wifi, control center always stay
             else { return false }
             return iconSpans(of: app, screens: screens).contains { $0 ~= x }
