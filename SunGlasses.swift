@@ -113,8 +113,7 @@ final class SunGlasses: NSObject, NSApplicationDelegate {
         assertion?.perform(NSSelectorFromString("invalidate"))
         assertion = nil
         updateIcon()
-        // once the icons are back, line up any that sit on the wrong side of the glasses
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.tuck(Array(self.inside)) {} }
+        // no tucking here: it would grab the mouse just as the user goes to ⌘-drag an icon out
     }
 
     func fold() {
@@ -133,8 +132,9 @@ final class SunGlasses: NSObject, NSApplicationDelegate {
                 down = (m, g)
                 grabbed = nil
                 let screens = NSScreen.screens.map(\.frame)
+                let hidden = assertion != nil ? inside : []
                 axQueue.async {
-                    let id = Self.app(atBarX: m.x, screens: screens)?.bundleIdentifier
+                    let id = Self.app(atBarX: m.x, screens: screens, skipping: hidden)?.bundleIdentifier
                     DispatchQueue.main.async { self.grabbed = id }
                 }
             } else if let d = down {
@@ -179,7 +179,7 @@ final class SunGlasses: NSObject, NSApplicationDelegate {
     }
 
     func dropped(at m: CGPoint?, from d: (at: CGPoint, glasses: ClosedRange<CGFloat>), glassesNow: ClosedRange<CGFloat>?) {
-        guard let id = grabbed else { return }
+        guard let id = grabbed else { return log.notice("⌘-drag: no app icon under the pointer") }
         grabbed = nil
         // macOS slides icons aside while you drag, so where the glasses were before or after both count
         let onGlasses = m.map { m in m.y < 40 && [d.glasses, glassesNow].contains { $0.map { $0.lowerBound - 4 ... $0.upperBound + 4 ~= m.x } ?? false } } ?? false
@@ -208,9 +208,10 @@ final class SunGlasses: NSObject, NSApplicationDelegate {
     }
 
     // The app owning the menu bar icon at this distance from the right edge.
-    static func app(atBarX x: CGFloat, screens: [CGRect]) -> NSRunningApplication? {
+    // Hidden apps keep reporting where their icons last were, on top of the visible ones there now, so skip them.
+    static func app(atBarX x: CGFloat, screens: [CGRect], skipping hidden: Set<String>) -> NSRunningApplication? {
         NSWorkspace.shared.runningApplications.first { app in
-            guard app.activationPolicy != .prohibited, app.bundleIdentifier != nil, app.processIdentifier != getpid(),
+            guard app.activationPolicy != .prohibited, let id = app.bundleIdentifier, !hidden.contains(id), app.processIdentifier != getpid(),
                   app.bundleURL?.path.hasPrefix("/System/") == false  // clock, wifi, control center always stay
             else { return false }
             return iconSpans(of: app, screens: screens).contains { $0 ~= x }
